@@ -22,3 +22,15 @@ Open http://127.0.0.1:8765. In production, the app binds to `0.0.0.0:$PORT` auto
 ## Important privacy note
 
 This is a public web app. Do not enter personal data. Favorites are shared across visitors to the same deployment (there is no authentication). For private favorites, add authentication and per-user storage before distributing the site widely.
+
+## Correctif V1.1 (octobre 2026)
+
+EU Careers redirige les deux listes vers `selection.eu-careers.europa.eu`.
+La version initiale rejetait cette redirection. V1.1 utilise les URLs officielles
+actuelles et autorise les deux sous-domaines officiels pour les annonces et la pagination.
+
+Pour mettre a jour un deploiement Render existant : remplacez `app.py` dans votre
+depot GitHub par celui de cette archive, validez (commit) et laissez Render redeployer.
+Lancez ensuite **Actualiser les offres**. Si le site officiel bloque les requetes
+depuis Render, le message d'erreur indique le probleme restant. La collecte en
+production n'a pas pu etre testee depuis l'environnement de creation.

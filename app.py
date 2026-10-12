@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 
 ROOT=Path(__file__).resolve().parent
 DB=Path(os.environ.get('DB_PATH', str(ROOT/'tracker.sqlite3')))
-SOURCES={'Commission européenne':'https://eu-careers.europa.eu/en/job-opportunities/open-vacancies/ec_vacancies', 'Institutions et agences':'https://eu-careers.europa.eu/en/job-opportunities/open-vacancies/cast'}
+SOURCES={'Commission européenne':'https://selection.eu-careers.europa.eu/en/job-opportunities/open-vacancies/ec_vacancies', 'Institutions et agences':'https://selection.eu-careers.europa.eu/en/job-opportunities/open-vacancies/cast'}
 UA='Mozilla/5.0 (compatible; PersonalFGIVTracker/1.0)'
 lock=threading.Lock()
 state={'running':False,'message':'Pas encore synchronise','last':None}
@@ -26,7 +26,7 @@ def fetch(url):
  req=Request(url,headers={'User-Agent':UA,'Accept-Language':'en'})
  with urlopen(req,timeout=22) as response:
   final=response.geturl()
-  if urlparse(final).hostname!='eu-careers.europa.eu':raise ValueError('Redirection hors EU Careers')
+  if urlparse(final).hostname not in ('eu-careers.europa.eu','selection.eu-careers.europa.eu'):raise ValueError('Redirection hors des domaines officiels EU Careers: '+urlparse(final).hostname)
   return response.read(3000000).decode('utf-8','replace')
 
 def parse_page(html,source,page_url):
@@ -51,7 +51,7 @@ def parse_page(html,source,page_url):
    a=cells[0].find('a',href=True)
    if not a:continue
    link=urljoin(page_url,a['href'])
-   if urlparse(link).hostname!='eu-careers.europa.eu':continue
+   if urlparse(link).hostname not in ('eu-careers.europa.eu','selection.eu-careers.europa.eu'):continue
    title=text(a) or text(cells[0])
    rows.append(dict(url=link,title=title,domain=get('domain'),org=get('dg','institution/eu body','institution'),grade=grade,location=get('location'),published=get('publication'),deadline=get('deadline'),source=source))
  return rows,soup
@@ -62,7 +62,7 @@ def next_page(soup,current):
   label=(' '.join([text(a),a.get('aria-label',''),a.get('title','')])).lower()
   if 'next' in rel or re.search(r'\bnext\b|\bolder\b|›|»',label):
    url=urljoin(current,a['href'])
-   if urlparse(url).hostname=='eu-careers.europa.eu' and urlparse(url).path==urlparse(current).path:return url
+   if urlparse(url).hostname in ('eu-careers.europa.eu','selection.eu-careers.europa.eu') and urlparse(url).path==urlparse(current).path:return url
  return None
 
 def sync():
