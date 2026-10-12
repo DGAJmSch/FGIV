@@ -1,150 +1,267 @@
-"""EU FG IV Tracker - local-only web application (Python standard library)."""
-import csv, io, json, re, sqlite3, threading, webbrowser, os, time
-from datetime import datetime, timezone
+"""EU Careers Tracker v2. Self-hosted, no affiliation with EPSO."""
+import csv, io, json, os, re, sqlite3, threading, time, smtplib, ssl, hashlib, hmac
+from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
 ROOT=Path(__file__).resolve().parent
-DB=Path(os.environ.get('DB_PATH', str(ROOT/'tracker.sqlite3')))
-SOURCES={'Commission européenne':'https://selection.eu-careers.europa.eu/en/job-opportunities/open-vacancies/ec_vacancies', 'Institutions et agences':'https://selection.eu-careers.europa.eu/en/job-opportunities/open-vacancies/cast'}
-UA='Mozilla/5.0 (compatible; PersonalFGIVTracker/1.0)'
-lock=threading.Lock()
-state={'running':False,'message':'Pas encore synchronise','last':None}
+DB=Path(os.environ.get('DB_PATH',str(ROOT/'tracker.sqlite3')))
+SOURCES={'Commission européenne':'https://selection.eu-careers.europa.eu/en/job-opportunities/open-vacancies/ec_vacancies','Institutions et agences':'https://selection.eu-careers.europa.eu/en/job-opportunities/open-vacancies/cast'}
+HOSTS={'selection.eu-careers.europa.eu','eu-careers.europa.eu'}
+UA='Mozilla/5.0 (compatible; EUCareersPersonalTracker/2.0)'
+LOCK=threading.Lock(); STATE={'running':False,'last':None,'message':'Prêt','errors':[],'sources':{}}
+MAX_PAGES=int(os.getenv('MAX_PAGES','40'))
+MAX_PDFS=int(os.getenv('MAX_PDFS_PER_SYNC','15'))
+PDF_BYTES=8_000_000
 
-def db():
- c=sqlite3.connect(DB,timeout=20);c.row_factory=sqlite3.Row
- c.execute('CREATE TABLE IF NOT EXISTS jobs (url TEXT PRIMARY KEY,title TEXT,domain TEXT,org TEXT,grade TEXT,location TEXT,published TEXT,deadline TEXT,source TEXT,description TEXT,first_seen TEXT,last_seen TEXT,active INTEGER DEFAULT 1,favorite INTEGER DEFAULT 0)')
+def now():return datetime.now(timezone.utc).isoformat(timespec='seconds')
+def conn():
+ DB.parent.mkdir(parents=True,exist_ok=True)
+ c=sqlite3.connect(DB,timeout=30);c.row_factory=sqlite3.Row;c.execute('PRAGMA busy_timeout=30000');c.execute('PRAGMA journal_mode=WAL')
+ c.executescript('''CREATE TABLE IF NOT EXISTS jobs(url TEXT PRIMARY KEY,title TEXT,domain TEXT,org TEXT,grade TEXT,location TEXT,published TEXT,deadline TEXT,source TEXT,description TEXT DEFAULT '',first_seen TEXT,last_seen TEXT,active INTEGER DEFAULT 1,favorite INTEGER DEFAULT 0,pdf_url TEXT DEFAULT '',pdf_text TEXT DEFAULT '',pdf_status TEXT DEFAULT '',pdf_checked TEXT DEFAULT '',content_hash TEXT DEFAULT '',deadline_iso TEXT DEFAULT '');
+ CREATE TABLE IF NOT EXISTS changes(id INTEGER PRIMARY KEY AUTOINCREMENT,job_url TEXT,at TEXT,kind TEXT,details TEXT);
+ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
+ CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT,job_url TEXT,kind TEXT,unique_key TEXT UNIQUE,created TEXT);''')
+ # Migration from v1.1, retaining favorites and history.
+ columns={r['name'] for r in c.execute('PRAGMA table_info(jobs)')}
+ for k,typ in {'pdf_url':'TEXT DEFAULT \'\'','pdf_text':'TEXT DEFAULT \'\'','pdf_status':'TEXT DEFAULT \'\'','pdf_checked':'TEXT DEFAULT \'\'','content_hash':'TEXT DEFAULT \'\'','deadline_iso':'TEXT DEFAULT \'\''}.items():
+  if k not in columns:c.execute(f'ALTER TABLE jobs ADD COLUMN {k} {typ}')
  c.commit();return c
 
-def text(el):
- return ' '.join(el.stripped_strings) if el else ''
+def valid(url):
+ p=urlparse(url);return p.scheme=='https' and p.hostname in HOSTS and not p.username and not p.password
 
-def fetch(url):
- req=Request(url,headers={'User-Agent':UA,'Accept-Language':'en'})
- with urlopen(req,timeout=22) as response:
-  final=response.geturl()
-  if urlparse(final).hostname not in ('eu-careers.europa.eu','selection.eu-careers.europa.eu'):raise ValueError('Redirection hors des domaines officiels EU Careers: '+urlparse(final).hostname)
-  return response.read(3000000).decode('utf-8','replace')
+def fetch(url,max_bytes=3_000_000):
+ if not valid(url):raise ValueError('URL hors domaines officiels EU Careers')
+ req=Request(url,headers={'User-Agent':UA,'Accept-Language':'en','Accept':'text/html,application/pdf,*/*'})
+ with urlopen(req,timeout=25) as r:
+  if not valid(r.geturl()):raise ValueError('Redirection hors EU Careers')
+  raw=r.read(max_bytes+1)
+  if len(raw)>max_bytes:raise ValueError('Document trop volumineux')
+  return raw,r.geturl(),r.headers.get('Content-Type','')
 
-def parse_page(html,source,page_url):
- from bs4 import BeautifulSoup
- soup=BeautifulSoup(html,'html.parser')
- rows=[]
+def txt(el):return ' '.join(el.stripped_strings) if el else ''
+def date_iso(s):
+ s=s or ''
+ m=re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})',s)
+ if m:
+  try:return f'{int(m[3]):04d}-{int(m[2]):02d}-{int(m[1]):02d}'
+  except ValueError:pass
+ m=re.search(r'(\d{4})-(\d{2})-(\d{2})',s)
+ return m.group(0) if m else ''
+
+def grade_ok(g):return bool(re.search(r'(?<![A-Z])FG\s*(?:I|II|III|IV)(?![A-Z])',g or '',re.I))
+def parse(html,source,url):
+ soup=BeautifulSoup(html,'html.parser');items=[]
  for table in soup.find_all('table'):
-  headings=[text(x).lower() for x in table.select('thead th')]
-  if not headings:headings=[text(x).lower() for x in table.find_all('th',limit=10)]
-  if not any('grade' in h for h in headings):continue
+  headers=[txt(x).lower() for x in table.select('thead th')]
+  if not headers:headers=[txt(x).lower() for x in table.find_all('th',limit=15)]
+  if not any('grade' in h for h in headers):continue
   for tr in table.select('tbody tr'):
    cells=tr.find_all('td',recursive=False)
    if not cells:continue
-   fields={headings[i]:text(cell) for i,cell in enumerate(cells) if i<len(headings)}
+   fields={headers[i]:txt(cell) for i,cell in enumerate(cells) if i<len(headers)}
    def get(*names):
-    for name in names:
+    for n in names:
      for k,v in fields.items():
-      if name in k:return v
+      if n in k:return v
     return ''
    grade=get('grade')
-   if not re.search(r'\bFG\s*IV\b',grade,re.I):continue
-   a=cells[0].find('a',href=True)
-   if not a:continue
-   link=urljoin(page_url,a['href'])
-   if urlparse(link).hostname not in ('eu-careers.europa.eu','selection.eu-careers.europa.eu'):continue
-   title=text(a) or text(cells[0])
-   rows.append(dict(url=link,title=title,domain=get('domain'),org=get('dg','institution/eu body','institution'),grade=grade,location=get('location'),published=get('publication'),deadline=get('deadline'),source=source))
- return rows,soup
+   if not grade_ok(grade):continue
+   link=next((a for a in cells[0].find_all('a',href=True) if valid(urljoin(url,a['href']))),None)
+   if not link:continue
+   dest=urljoin(url,link['href'])
+   items.append(dict(url=dest,title=txt(link) or txt(cells[0]),domain=get('domain'),org=get('dg','institution/eu body','institution'),grade=grade,location=get('location'),published=get('publication'),deadline=get('deadline'),deadline_iso=date_iso(get('deadline')),source=source))
+ return items,soup
 
-def next_page(soup,current):
+def next_url(soup,url):
  for a in soup.select('a[href]'):
-  rel=' '.join(a.get('rel',[])).lower()
-  label=(' '.join([text(a),a.get('aria-label',''),a.get('title','')])).lower()
-  if 'next' in rel or re.search(r'\bnext\b|\bolder\b|›|»',label):
-   url=urljoin(current,a['href'])
-   if urlparse(url).hostname in ('eu-careers.europa.eu','selection.eu-careers.europa.eu') and urlparse(url).path==urlparse(current).path:return url
+  label=' '.join([txt(a),a.get('aria-label',''),a.get('title',''),' '.join(a.get('rel',[]))]).lower()
+  if re.search(r'\bnext\b|\bolder\b|›|»',label):
+   dest=urljoin(url,a['href'])
+   if valid(dest) and urlparse(dest).path==urlparse(url).path:return dest
  return None
 
-def sync():
- with lock:
-  if state['running']:return
-  state.update(running=True,message='Synchronisation en cours...')
+def pdf_links(html,base):
+ soup=BeautifulSoup(html,'html.parser');links=[]
+ for a in soup.select('a[href]'):
+  u=urljoin(base,a['href'])
+  if valid(u) and ('.pdf' in urlparse(u).path.lower() or 'pdf' in txt(a).lower()):links.append(u)
+ return list(dict.fromkeys(links))
+
+def enrich(c,url,force=False):
+ j=c.execute('SELECT * FROM jobs WHERE url=?',(url,)).fetchone()
+ if not j:return {'error':'Annonce introuvable'}
+ if j['pdf_checked'] and not force:return {'status':j['pdf_status'],'cached':True}
  try:
-  total=0;errors=[];now=datetime.now(timezone.utc).isoformat(timespec='seconds')
-  c=db()
-  for name,base in SOURCES.items():
-   seen=set();url=base;count=0;success=False
-   while url and url not in seen and count<40:
-    seen.add(url);count+=1
-    try:
-     html=fetch(url);items,soup=parse_page(html,name,url);success=True
-     for j in items:
-      c.execute('''INSERT INTO jobs(url,title,domain,org,grade,location,published,deadline,source,description,first_seen,last_seen,active) VALUES(?,?,?,?,?,?,?,?,?,?,?, ?,1)
-      ON CONFLICT(url) DO UPDATE SET title=excluded.title,domain=excluded.domain,org=excluded.org,grade=excluded.grade,location=excluded.location,published=excluded.published,deadline=excluded.deadline,source=excluded.source,last_seen=excluded.last_seen,active=1''',
-      (j['url'],j['title'],j['domain'],j['org'],j['grade'],j['location'],j['published'],j['deadline'],j['source'],'',now,now))
-      total+=1
-     url=next_page(soup,url)
-    except Exception as e:errors.append(name+': '+str(e));break
-   if success and not errors or success and not any(x.startswith(name+':') for x in errors):
-    c.execute('UPDATE jobs SET active=0 WHERE source=? AND last_seen<>?',(name,now))
-  c.commit();c.close()
-  state.update(message=f'{total} annonces FG IV trouvees. '+('Erreurs : '+' | '.join(errors) if errors else 'Synchronisation terminee.'),last=now)
- except Exception as e:state['message']='Erreur : '+str(e)
- finally:state['running']=False
-
-def date_key(s):
- m=re.search(r'(\d{2})/(\d{2})/(\d{4})',s or '')
- return f'{m[3]}-{m[2]}-{m[1]}' if m else ''
-
-HTML='''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EU FG IV Tracker</title><style>
-:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#18283a;background:#f5f7fa}*{box-sizing:border-box}body{margin:0}header{background:#142b4b;color:white;padding:25px max(24px,calc((100vw - 1200px)/2))}h1{margin:0;font-size:26px}header p{opacity:.8;margin:7px 0 0}main{max-width:1200px;margin:24px auto;padding:0 18px}.toolbar,.filters,.stats{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.toolbar{justify-content:space-between;margin-bottom:16px}button,.button{cursor:pointer;border:1px solid #c8d1de;border-radius:8px;background:white;padding:10px 13px;color:#183454;font-weight:600;text-decoration:none}.primary{background:#164a85;color:white;border-color:#164a85}button:hover,.button:hover{filter:brightness(.95)}button:disabled{opacity:.5}.panel{background:white;border:1px solid #dfe5ed;border-radius:12px;padding:16px;margin-bottom:16px}.filters input,.filters select{border:1px solid #c8d1de;border-radius:8px;padding:11px;min-width:145px;flex:1}.filters input{flex:3;min-width:220px}.stats{color:#52647b;font-size:14px;margin-bottom:12px}.job{border-top:1px solid #e6ebf0;padding:16px 0}.job:first-child{border-top:0}.job h3{font-size:17px;margin:0 0 6px}.meta{color:#54677d;font-size:13px;line-height:1.9}.tag{display:inline-block;border-radius:5px;background:#e6effa;color:#174779;padding:3px 7px;font-weight:700;font-size:12px;margin-right:8px}.actions{display:flex;gap:10px;margin-top:10px}.empty{padding:36px;text-align:center;color:#69798b}.muted{color:#64748b;font-size:13px}.warning{background:#fff7e7;border:1px solid #f1ddb2;padding:12px;border-radius:8px;font-size:13px;margin-bottom:15px}#status{font-size:13px;color:#5b6c81}a{color:#1457a0}@media(max-width:650px){header{padding:20px}main{margin:12px auto}.filters{flex-direction:column}.filters input,.filters select{width:100%}}
-</style></head><body><header><h1>EU FG IV Tracker</h1><p>Offres officielles · Agents contractuels · Groupe de fonctions IV</p></header><main><div class="toolbar"><div><button class="primary" id="sync">↻ Actualiser les offres</button> <a class="button" href="/export.csv">Exporter CSV</a></div><span id="status">Chargement...</span></div><div class="warning">Les annonces proviennent d'EU Careers. Vérifiez toujours les conditions et dates limites sur l'annonce officielle. Les offres peuvent ne pas être exhaustives si le site change ou bloque la collecte.</div><div class="panel filters"><input id="q" placeholder="Rechercher : poste, DG, domaine..."><select id="source"><option value="">Toutes les institutions</option><option>Commission européenne</option><option>Institutions et agences</option></select><select id="location"><option value="">Tous les lieux</option></select><select id="statusFilter"><option value="active">Annonces présentes à la dernière collecte</option><option value="all">Toutes les annonces enregistrées</option><option value="favorite">Favoris</option></select></div><div class="stats"><b id="count">0 offre</b><span>Grade FG IV vérifié dans la colonne officielle « Grade »</span></div><section class="panel" id="jobs"><div class="empty">Chargement...</div></section><p class="muted">Données stockées uniquement sur cet ordinateur (tracker.sqlite3). Aucune donnée de candidature n'est transmise. Cette application n'est pas affiliée à EPSO.</p></main><script>
-let data=[];const $=id=>document.getElementById(id);function safe(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function dt(s){let m=String(s||'').match(/(\\d{2})\\/(\\d{2})\\/(\\d{4})/);return m?m[3]+'-'+m[2]+'-'+m[1]:''}function render(){let q=$('q').value.toLowerCase(),s=$('source').value,l=$('location').value,st=$('statusFilter').value;let jobs=data.filter(j=>(!q||[j.title,j.org,j.domain,j.location].join(' ').toLowerCase().includes(q))&&(!s||j.source===s)&&(!l||j.location===l)&&(st==='all'||(st==='favorite'?j.favorite:j.active)));jobs.sort((a,b)=>dt(a.deadline).localeCompare(dt(b.deadline)));$('count').textContent=jobs.length+' offre'+(jobs.length>1?'s':'');$('jobs').innerHTML=jobs.length?jobs.map(j=>`<article class="job"><h3>${safe(j.title)}</h3><div class="meta"><span class="tag">FG IV</span>${safe(j.org||j.source)} · ${safe(j.location||'Lieu non indiqué')}<div>Domaine : ${safe(j.domain||'Non indiqué')} · Publication : ${safe(j.published||'Non indiquée')} · <b>Clôture : ${safe(j.deadline||'À vérifier')}</b></div><div>Source : ${safe(j.source)} ${j.active?'':' · Non retrouvée lors de la dernière collecte complète'}</div></div><div class="actions"><a class="button" href="${safe(j.url)}" target="_blank" rel="noopener noreferrer">Voir l'annonce officielle ↗</a><button data-fav="${safe(j.url)}">${j.favorite?'★ Favori':'☆ Ajouter aux favoris'}</button></div></article>`).join(''):'<div class="empty">Aucune offre correspondant aux filtres. Cliquez sur « Actualiser les offres » pour lancer une collecte.</div>';document.querySelectorAll('[data-fav]').forEach(b=>b.onclick=async()=>{await fetch('/favorite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.fav})});await load()})}async function load(){try{let r=await fetch('/api');let v=await r.json();data=v.jobs;$('status').textContent=v.state.message;let old=$('location').value;let places=[...new Set(data.map(j=>j.location).filter(Boolean))].sort();$('location').innerHTML='<option value="">Tous les lieux</option>'+places.map(p=>`<option value="${safe(p)}">${safe(p)}</option>`).join('');$('location').value=old;render();if(v.state.running)setTimeout(load,2000)}catch(e){$('status').textContent='Erreur de chargement : '+e}}$('sync').onclick=async()=>{await fetch('/sync',{method:'POST'});await load()};['q','source','location','statusFilter'].forEach(id=>$(id).addEventListener('input',render));load();</script></body></html>'''
-
-class Handler(BaseHTTPRequestHandler):
- def log_message(self,*args):pass
- def send(self,body,ctype='application/json',code=200):
-  b=body.encode('utf-8') if isinstance(body,str) else body
-  self.send_response(code);self.send_header('Content-Type',ctype+'; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
- def do_GET(self):
-  path=urlparse(self.path).path
-  if path=='/':return self.send(HTML,'text/html')
-  if path=='/api':
-   c=db();jobs=[dict(x) for x in c.execute('SELECT * FROM jobs')];c.close();return self.send(json.dumps({'jobs':jobs,'state':state},ensure_ascii=False))
-  if path=='/export.csv':
-   c=db();rows=c.execute('SELECT title,org,domain,grade,location,published,deadline,source,url,active,favorite FROM jobs ORDER BY deadline').fetchall();c.close()
-   out=io.StringIO();w=csv.writer(out);w.writerow(['Poste','Institution/DG','Domaine','Grade','Lieu','Publication','Cloture','Source','Lien','Present derniere collecte','Favori']);w.writerows(rows)
-   return self.send('\ufeff'+out.getvalue(),'text/csv')
-  self.send('Not found','text/plain',404)
- def do_POST(self):
-  path=urlparse(self.path).path
-  if path=='/sync':
-   if not state['running']:threading.Thread(target=sync,daemon=True).start()
-   return self.send('{"ok":true}')
-  if path=='/favorite':
+  raw,final,typ=fetch(url)
+  html=raw.decode('utf-8','replace');soup=BeautifulSoup(html,'html.parser')
+  main=soup.select_one('main') or soup.select_one('article') or soup
+  for t in main.select('script,style,nav,footer,header'):t.decompose()
+  description=txt(main)[:14000]
+  links=pdf_links(html,final);pdf_url='';pdf_text='';status='page_only'
+  for link in links[:3]:
    try:
-    n=int(self.headers.get('Content-Length','0'));obj=json.loads(self.rfile.read(min(n,10000)));url=obj.get('url','')
-    c=db();c.execute('UPDATE jobs SET favorite=1-favorite WHERE url=?',(url,));c.commit();c.close();return self.send('{"ok":true}')
-   except Exception as e:return self.send(json.dumps({'error':str(e)}),code=400)
-  self.send('Not found','text/plain',404)
+    data,real,content_type=fetch(link,PDF_BYTES)
+    if not (data.startswith(b'%PDF') or 'pdf' in content_type.lower()):continue
+    reader=PdfReader(io.BytesIO(data));pdf_text='\n'.join((p.extract_text() or '') for p in reader.pages[:40])[:90000]
+    pdf_url=real;status='pdf_extracted' if pdf_text.strip() else 'pdf_no_text';break
+   except Exception:continue
+  c.execute('UPDATE jobs SET description=?,pdf_url=?,pdf_text=?,pdf_status=?,pdf_checked=? WHERE url=?',(description,pdf_url,pdf_text,status,now(),url));c.commit()
+  return {'status':status,'pdf_url':pdf_url,'characters':len(pdf_text)}
+ except Exception as e:
+  c.execute('UPDATE jobs SET pdf_status=?,pdf_checked=? WHERE url=?',('error: '+str(e)[:150],now(),url));c.commit();return {'error':str(e)}
 
-def auto_sync_loop():
- hours=float(os.environ.get('AUTO_SYNC_HOURS','0'))
- if hours<=0:return
+def log(c,url,kind,details):c.execute('INSERT INTO changes(job_url,at,kind,details) VALUES(?,?,?,?)',(url,now(),kind,details))
+def sync():
+ if not LOCK.acquire(blocking=False):return
+ STATE.update(running=True,message='Synchronisation en cours',errors=[])
+ try:
+  c=conn();total=0;all_errors=[];sources={};stamp=now();new=[]
+  for name,base in SOURCES.items():
+   seen_pages=set();seen_jobs=set();url=base;count=0;complete=False;errors=[]
+   while url and url not in seen_pages and count<MAX_PAGES:
+    seen_pages.add(url);count+=1
+    try:
+     raw,final,_=fetch(url);items,soup=parse(raw.decode('utf-8','replace'),name,final)
+     if count==1 and not soup.find('table'):raise ValueError('Aucun tableau détecté : structure modifiée')
+     for j in items:
+      seen_jobs.add(j['url']);total+=1
+      old=c.execute('SELECT * FROM jobs WHERE url=?',(j['url'],)).fetchone()
+      signature=hashlib.sha256(json.dumps([j[k] for k in ('title','domain','org','grade','location','published','deadline')],ensure_ascii=False).encode()).hexdigest()
+      if not old:log(c,j['url'],'new',j['title']);new.append(j)
+      elif old['content_hash'] and old['content_hash']!=signature:log(c,j['url'],'changed','Métadonnées de l’annonce modifiées')
+      c.execute('''INSERT INTO jobs(url,title,domain,org,grade,location,published,deadline,source,first_seen,last_seen,active,content_hash,deadline_iso) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?)
+      ON CONFLICT(url) DO UPDATE SET title=excluded.title,domain=excluded.domain,org=excluded.org,grade=excluded.grade,location=excluded.location,published=excluded.published,deadline=excluded.deadline,source=excluded.source,last_seen=excluded.last_seen,active=1,content_hash=excluded.content_hash,deadline_iso=excluded.deadline_iso''',(j['url'],j['title'],j['domain'],j['org'],j['grade'],j['location'],j['published'],j['deadline'],j['source'],stamp,stamp,signature,j['deadline_iso']))
+     c.commit();url=next_url(soup,final)
+    except Exception as e:errors.append(str(e));break
+   if url and count>=MAX_PAGES:errors.append('Limite de pagination atteinte')
+   complete=not errors
+   if complete:
+    previous=c.execute('SELECT url FROM jobs WHERE source=? AND active=1 AND last_seen<>?',(name,stamp)).fetchall()
+    for old in previous:log(c,old['url'],'missing','Absente de la dernière collecte complète')
+    c.execute('UPDATE jobs SET active=0 WHERE source=? AND last_seen<>?',(name,stamp));c.commit()
+   else:all_errors.append(name+': '+'; '.join(errors))
+   sources[name]={'pages':count,'found':len(seen_jobs),'complete':complete,'errors':errors}
+  # Limited automatic enrichment; manual button available for any vacancy.
+  for row in c.execute("SELECT url FROM jobs WHERE active=1 AND (pdf_checked IS NULL OR pdf_checked='') ORDER BY first_seen DESC LIMIT ?",(MAX_PDFS,)).fetchall():enrich(c,row['url'])
+  c.commit();c.close();STATE.update(last=stamp,sources=sources,errors=all_errors,message=f'{total} offres contractuelles relevées. '+('Collecte partielle : '+' | '.join(all_errors) if all_errors else 'Collecte terminée.'))
+  notify_new(new)
+ except Exception as e:STATE.update(message='Erreur : '+str(e),errors=[str(e)])
+ finally:STATE['running']=False;LOCK.release()
+
+def smtp_send(subject,body):
+ host=os.getenv('SMTP_HOST');recipient=os.getenv('ALERT_TO');sender=os.getenv('ALERT_FROM')
+ if not all((host,recipient,sender)):return False
+ msg=EmailMessage();msg['Subject']=subject;msg['From']=sender;msg['To']=recipient;msg.set_content(body)
+ port=int(os.getenv('SMTP_PORT','587'))
+ if port==465:
+  s=smtplib.SMTP_SSL(host,port,timeout=20,context=ssl.create_default_context())
+ else:
+  s=smtplib.SMTP(host,port,timeout=20);s.starttls(context=ssl.create_default_context())
+ with s:
+  if os.getenv('SMTP_USER'):s.login(os.getenv('SMTP_USER'),os.getenv('SMTP_PASSWORD',''))
+  s.send_message(msg)
+ return True
+
+def notify_new(items):
+ if not items:return
+ c=conn();items=[j for j in items if re.search(r'\bFG\s*IV\b',j['grade'],re.I)]
+ if not items:c.close();return
+ unsent=[j for j in items if not c.execute('SELECT 1 FROM alerts WHERE unique_key=?',('new:'+j['url'],)).fetchone()]
+ if unsent:
+  body='\n\n'.join(f"{j['title']} | {j['org']} | {j['grade']} | {j['deadline']}\n{j['url']}" for j in unsent[:40])
+  try:
+   if smtp_send(f'EU Careers : {len(unsent)} nouvelles offres FG IV',body):
+    for j in unsent:c.execute('INSERT OR IGNORE INTO alerts(job_url,kind,unique_key,created) VALUES(?,?,?,?)',(j['url'],'new','new:'+j['url'],now()))
+    c.commit()
+  except Exception as e:STATE['errors'].append('Email : '+str(e))
+ c.close()
+
+def deadlines():
+ if not os.getenv('ALERT_TO'):return
+ today=datetime.now(timezone.utc).date();c=conn()
+ for days in (7,3,1):
+  date=(today+timedelta(days=days)).isoformat()
+  for j in c.execute('SELECT * FROM jobs WHERE active=1 AND deadline_iso=? AND grade LIKE ?', (date,'%IV%')).fetchall():
+   key=f'deadline:{days}:{j["url"]}:{date}'
+   if c.execute('SELECT 1 FROM alerts WHERE unique_key=?',(key,)).fetchone():continue
+   try:
+    if smtp_send(f'EU Careers : échéance J-{days} : {j["title"]}',f"{j['title']}\n{j['deadline']}\n{j['url']}\nVérifie l'heure exacte sur l'annonce officielle."):
+     c.execute('INSERT OR IGNORE INTO alerts(job_url,kind,unique_key,created) VALUES(?,?,?,?)',(j['url'],'deadline',key,now()));c.commit()
+   except Exception as e:STATE['errors'].append('Email : '+str(e))
+ c.close()
+
+def loop():
  time.sleep(10)
  while True:
-  sync()
-  time.sleep(hours*3600)
+  sync();deadlines();time.sleep(max(1,float(os.getenv('AUTO_SYNC_HOURS','12')))*3600)
+
+HTML=Path(ROOT/'index.html').read_text(encoding='utf-8')
+class Handler(BaseHTTPRequestHandler):
+ def log_message(self,*args):pass
+ def send(self,obj,ctype='application/json',status=200):
+  b=(json.dumps(obj,ensure_ascii=False).encode() if isinstance(obj,(dict,list)) else obj.encode() if isinstance(obj,str) else obj)
+  self.send_response(status);self.send_header('Content-Type',ctype+'; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(b)
+ def authorized(self):
+  password=os.getenv('TRACKER_PASSWORD','')
+  if not password:return True
+  import base64
+  h=self.headers.get('Authorization','')
+  try:actual=base64.b64decode(h.split(' ',1)[1]).decode().split(':',1)[1] if h.startswith('Basic ') else ''
+  except Exception:actual=''
+  if hmac.compare_digest(actual,password):return True
+  self.send_response(401);self.send_header('WWW-Authenticate','Basic realm="EU Careers Tracker"');self.end_headers();return False
+ def do_GET(self):
+  if urlparse(self.path).path=='/health':return self.send({'ok':True})
+  if not self.authorized():return
+  p=urlparse(self.path);path=p.path
+  if path=='/':return self.send(HTML,'text/html')
+  if path=='/health':return self.send({'ok':True})
+  if path=='/api':
+   c=conn();jobs=[dict(j) for j in c.execute('SELECT url,title,domain,org,grade,location,published,deadline,deadline_iso,source,description,pdf_text,first_seen,last_seen,active,favorite,pdf_url,pdf_status,pdf_checked FROM jobs ORDER BY first_seen DESC')];c.close()
+   return self.send({'jobs':jobs,'state':STATE,'email_configured':bool(os.getenv('SMTP_HOST') and os.getenv('ALERT_TO'))})
+  if path=='/job':
+   u=parse_qs(p.query).get('url',[''])[0];c=conn();j=c.execute('SELECT * FROM jobs WHERE url=?',(u,)).fetchone();history=[dict(x) for x in c.execute('SELECT at,kind,details FROM changes WHERE job_url=? ORDER BY id DESC LIMIT 30',(u,))];c.close()
+   return self.send({'job':dict(j),'history':history} if j else {'error':'Introuvable'},status=200 if j else 404)
+  if path=='/history':
+   c=conn();rows=[dict(x) for x in c.execute('SELECT changes.at,changes.kind,changes.details,jobs.title,changes.job_url FROM changes LEFT JOIN jobs ON jobs.url=changes.job_url ORDER BY changes.id DESC LIMIT 250')];c.close();return self.send(rows)
+  if path=='/export.csv':
+   c=conn();rows=c.execute('SELECT title,org,domain,grade,location,published,deadline,source,url,active,favorite,pdf_url,pdf_status FROM jobs').fetchall();c.close()
+   out=io.StringIO();w=csv.writer(out);w.writerow(['Poste','Institution','Domaine','Grade','Lieu','Publication','Cloture','Source','URL','Actif','Favori','PDF','Extraction'])
+   for r in rows:w.writerow([("'"+str(v) if str(v).startswith(('=','+','-','@')) else v) for v in r])
+   return self.send('\ufeff'+out.getvalue(),'text/csv')
+  return self.send({'error':'Route inconnue'},status=404)
+ def do_POST(self):
+  if not self.authorized():return
+  path=urlparse(self.path).path
+  n=int(self.headers.get('Content-Length','0') or 0)
+  if n>20000:return self.send({'error':'Trop volumineux'},status=413)
+  try:payload=json.loads(self.rfile.read(n) or b'{}')
+  except Exception:return self.send({'error':'JSON invalide'},status=400)
+  if path=='/sync':
+   if not STATE['running']:threading.Thread(target=sync,daemon=True).start()
+   return self.send({'ok':True})
+  if path in ('/favorite','/enrich'):
+   u=payload.get('url','');c=conn()
+   if not c.execute('SELECT 1 FROM jobs WHERE url=?',(u,)).fetchone():c.close();return self.send({'error':'Annonce inconnue'},status=404)
+   if path=='/favorite':c.execute('UPDATE jobs SET favorite=1-favorite WHERE url=?',(u,));c.commit();result={'ok':True}
+   else:result=enrich(c,u,force=bool(payload.get('force')))
+   c.close();return self.send(result)
+  if path=='/alerts/check':
+   threading.Thread(target=deadlines,daemon=True).start();return self.send({'ok':True})
+  return self.send({'error':'Route inconnue'},status=404)
 
 if __name__=='__main__':
- DB.parent.mkdir(parents=True,exist_ok=True)
- db().close()
- port=int(os.environ.get('PORT','8765'))
- host='0.0.0.0' if os.environ.get('PORT') else '127.0.0.1'
- server=ThreadingHTTPServer((host,port),Handler)
- print(f'EU FG IV Tracker : http://{host}:{port}',flush=True)
- if os.environ.get('AUTO_SYNC_HOURS'):
-  threading.Thread(target=auto_sync_loop,daemon=True).start()
- if not os.environ.get('PORT'):webbrowser.open(f'http://127.0.0.1:{port}')
- try:server.serve_forever()
- except KeyboardInterrupt:pass
+ conn().close();port=int(os.getenv('PORT','8765'))
+ if os.getenv('AUTO_SYNC_HOURS','12')!='0':threading.Thread(target=loop,daemon=True).start()
+ host='0.0.0.0' if os.getenv('PORT') else '127.0.0.1'
+ print(f'EU Careers Tracker listening on {host}:{port}',flush=True)
+ ThreadingHTTPServer((host,port),Handler).serve_forever()

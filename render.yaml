@@ -5,8 +5,11 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
+    healthCheckPath: /health
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: AUTO_SYNC_HOURS
         value: "12"
+      - key: MAX_PDFS_PER_SYNC
+        value: "15"
