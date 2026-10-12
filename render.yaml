@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: eu-fgiv-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: AUTO_SYNC_HOURS
+        value: "12"
